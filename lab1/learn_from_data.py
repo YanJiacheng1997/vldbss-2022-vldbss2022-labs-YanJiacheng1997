@@ -1,7 +1,4 @@
 from enum import Enum
-
-import pandas as pd
-
 from statistics import Histogram, MIN_VAL, MAX_VAL
 import csv
 from sklearn.cluster import KMeans
@@ -59,17 +56,12 @@ class LeafNode():
 
     def estimate(self, range_query):
         # YOUR CODE HERE
-        col_name = self.col_names[self.scope.col_idxs[0]]
-        if col_name in range_query.col_left:
-            left_value = range_query.col_left[col_name]
-            right_value = range_query.col_right[col_name]
-        else:
-            left_value =MIN_VAL
-            right_value =MAX_VAL
-            assert (left_value <= right_value)
-            rows = self.hist.between_row_count((left_value,right_value,0))
-            return rows / self.scope.n_rows()
-
+        col_idx = self.scope.col_idxs[0]
+        col_name = self.col_names[col_idx]
+        left, right = range_query.column_range(col_name, MIN_VAL, MAX_VAL)
+        row_cnt = self.hist.between_row_count(left, right, None)
+        sel = float(row_cnt) / float(self.scope.n_rows())
+        return sel
 
     def debug_print(self, prefix, indent):
         print('%sLeafNode: %s, %s' % (prefix, self.scope, self.hist))
@@ -86,7 +78,13 @@ class SumNode():
 
     def estimate(self, range_query):
         # YOUR CODE HERE
-        pass
+        l_sel = self.lchild.estimate(range_query)
+        r_sel = self.rchild.estimate(range_query)
+        l_rows = self.lchild.scope.n_rows()
+        r_rows = self.rchild.scope.n_rows()
+        l_weight = float(l_rows) / float(l_rows + r_rows)
+        r_weight = float(r_rows) / float(l_rows + r_rows)
+        return l_sel*l_weight + r_sel*r_weight
 
     def debug_print(self, prefix, indent):
         print('%sSumNode: %s' % (prefix, self.scope))
@@ -105,7 +103,9 @@ class ProductNode():
 
     def estimate(self, range_query):
         # YOUR CODE HERE
-        pass
+        l_sel = self.lchild.estimate(range_query)
+        r_sel = self.rchild.estimate(range_query)
+        return l_sel * r_sel
 
     def debug_print(self, prefix, indent):
         print('%sProductNode: %s' % (prefix, self.scope))
@@ -153,27 +153,27 @@ class SPN:
         It uses kmeans algorithm to split these rows.
         """
         # YOUR CODE HERE
-        # assert (scope.n_rows() >1)
+        np_array = SPN.construct_np_array(dataset, scope)
+        assert(len(np_array) > 0)
+        same = True
+        for r in np_array:
+            if not np.array_equal(r, np_array[0]):
+                same = False
+                break
+        if same:
+            n_rows = int(scope.n_rows()/2)
+            return NodeScope(scope.row_idxs[:n_rows], scope.col_idxs), NodeScope(scope.row_idxs[n_rows:], scope.col_idxs)
 
-        np_array = SPN.construct_np_array((dataset,scope))
-        quantity =pd.DataFrame(np_array).value_counts()
-        left = []
-        right = []
-        row_idxs = scope.rows_idxs
-        if len(quantity) > 1:
-            kmeans = KMeans(n_clusters=2)
-            result = kmeans.fit_predict(np_array)
-            for i in range(len(row_idxs)):
-                row_idxs = row_idxs[i]
-                if result[i] == 0:
-                    left.append(row_idxs)
-                elif result[i] == 1:
-                    right.append(row_idxs)
-        elif len(quantity) == 1:
-            left =row_idxs[len(row_idxs) // 2:]
-            right = row_idxs[:len(row_idxs) //2]
-
-        return NodeScope(left,scope.col_idxs),NodeScope(right,scope.col_idxs)
+        kmeans = KMeans(n_clusters=2, random_state=0).fit(np_array)
+        l_rows = []
+        r_rows = []
+        for i in range(0, scope.n_rows()):
+            row_idx = scope.row_idxs[i]
+            if kmeans.labels_[i] == 0:
+                l_rows.append(row_idx)
+            else:
+                r_rows.append(row_idx)
+        return NodeScope(l_rows, scope.col_idxs), NodeScope(r_rows, scope.col_idxs)
 
 
     @staticmethod
@@ -221,23 +221,18 @@ class SPN:
         """
         get_next_op returns the next operation to do when constructing a SPN.
         """
-        # YOUR CODE HERE: return the next operation
-        op = None
-        force = False
-        if scope.n_cols() == 1:
-            if scope.n_rows() < row_batch_threshold:
-                op = Operation.CREATE_LEAF
+        if scope.n_cols() == 1:                             # if there is only 1 column left, 
+            # YOUR CODE HERE
+            if scope.n_rows() <= row_batch_threshold:       # and the number of rows is less than row_batch_threshold, 
+                return Operation.CREATE_LEAF, False         # then create a leaf node, 
             else:
-                op = Operation.SPLIT_ROWS
-        elif split_col_failed:
-            op = Operation.SPLIT_ROWS
-        elif scope.n_rows() < row_batch_threshold:
-            op = Operation.SPLIT_COLS
-            force = True
-        else:
-            op = Operation.SPLIT_COLS
-            return  op, force
+                return Operation.SPLIT_ROWS, False          # else split rows
+        if split_col_failed:                                # if split_col failed last time, 
+            return Operation.SPLIT_ROWS, False              # then split rows this time
 
+        if scope.n_rows() <= row_batch_threshold:           # if the number of rows is less than row_batch_threshold, 
+            return Operation.SPLIT_COLS, True               # then split cols enforcedly, 
+        return Operation.SPLIT_COLS, False                  # else try to split cols first.
 
 
     @staticmethod

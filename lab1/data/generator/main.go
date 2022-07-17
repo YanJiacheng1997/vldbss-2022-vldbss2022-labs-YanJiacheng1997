@@ -11,7 +11,6 @@ import (
 	"math/bits"
 	"math/rand"
 	"os"
-	"path"
 	"strings"
 	"sync"
 	"sync/atomic"

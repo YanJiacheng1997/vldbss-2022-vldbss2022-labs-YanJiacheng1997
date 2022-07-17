@@ -10,7 +10,6 @@ import xgboost as xgb
 
 
 def min_max_normalize(v, min_v, max_v):
-    # The function may be useful when dealing with lower/upper bounds of columns.
     assert max_v > min_v
     return (v-min_v)/(max_v-min_v)
 
@@ -19,133 +18,178 @@ def extract_features_from_query(range_query, table_stats, considered_cols):
     # feat:     [c1_begin, c1_end, c2_begin, c2_end, ... cn_begin, cn_end, AVI_sel, EBO_sel, Min_sel]
     #           <-                   range features                    ->, <-     est features     ->
     feature = []
-    # YOUR CODE HERE: extract features from query
     for col in considered_cols:
         min_val = table_stats.columns[col].min_val()
         max_val = table_stats.columns[col].max_val()
-        left,right = range_query.column_range(col,min_val,max_val)
-        feature.append(min_max_normalize(left,min_val,max_val))
-        feature.append(min_max_normalize(right,min_val,max_val))
-        feature.append(stats.MinSelEstimator.estimate((range_query,table_stats)))
+        (left, right) = range_query.column_range(col, min_val, max_val)
+        left = min_max_normalize(left, min_val, max_val)
+        right = min_max_normalize(right, min_val, max_val)
+        feature.append(left)
+        feature.append(right)
+    feature.append(stats.AVIEstimator.estimate(range_query, table_stats))
+    feature.append(stats.ExpBackoffEstimator.estimate(range_query, table_stats))
+    feature.append(stats.MinSelEstimator.estimate(range_query, table_stats))
     return feature
 
 
-
 def preprocess_queries(queris, table_stats, columns):
-    """
-    preprocess_queries turn queries into features and labels, which are used for regression model.
-    """
-    features, labels = [], []
+    inputs, labels = [], []
     for item in queris:
-        query, act_rows = item['query'], item['act_rows']
-        feature, label = None, None
-        # YOUR CODE HERE: transform (query, act_rows) to (feature, label)
-        # Some functions like rq.ParsedRangeQuery.parse_range_query and extract_features_from_query may be helpful.
-        parsed = rq.ParsedRangeQuery.parse_range_query((query))
-        feature = extract_features_from_query(parsed,table_stats,columns)
-        label = act_rows
-        features.append(feature)
-        labels.append(max(label,1))
-        label_max = max(label_max,label)
-    return features, labels
+        query = rq.ParsedRangeQuery.parse_range_query(item['query'])
+        feats = extract_features_from_query(query, table_stats, columns)
+        inputs.append(feats)
+        labels.append(np.log2(item['act_rows']))
+    return inputs, labels
 
 
 class QueryDataset(torch.utils.data.Dataset):
-    def __init__(self, queries, table_stats, columns):
+    def __init__(self, query_data, stats, columns):
         super().__init__()
-        self.query_data = list(zip*(preprocess_queries(queries, table_stats, columns)))
+        self.train_data = []
+        for item in query_data:
+            query = rq.ParsedRangeQuery.parse_range_query(item['query'])
+            # print(f"query={query}")
+            feats = extract_features_from_query(query, stats, columns)
+            # feature = torch.Tensor(feats[:-3])
+            feature = torch.Tensor(feats)
+            # print(f"feature={feature}")
+            # # We want the model to predict log2(est_rows) rather than est_rows since est_rows must be large than or
+            # # equal to 0 while log2(est_rows) don't have any boundary. Hence we use log2(act_rows) as label rather
+            # # than act_rows.
+            # label = torch.log2(torch.Tensor([item['act_rows']]))
+            label = torch.Tensor([item['act_rows']])
+            self.train_data.append((feature, label))
 
     def __getitem__(self, index):
-        return self.query_data[index]
+        return self.train_data[index]
 
     def __len__(self):
-        return len(self.query_data)
+        return len(self.train_data)
+
+
+class MLP(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.layers = nn.Sequential(
+            nn.Linear(15, 512),
+            nn.ReLU(),
+            nn.Linear(512, 1024),
+            nn.ReLU(),
+            nn.Linear(1024, 512),
+            nn.ReLU(),
+            nn.Linear(512, 256),
+            nn.ReLU(),
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Linear(128, 32),
+            nn.ReLU(),
+            nn.Linear(32, 1),
+        )
+
+    def forward(self, x):
+        return self.layers(x)
+
+    def init_weights(self):
+        def init_fn(m):
+            if isinstance(m, nn.Linear):
+                # nn.init.xavier_uniform_(m.weight)
+                m.weight.data.uniform_(-0.0001, 0.0001)
+                m.bias.data.fill_(0)
+        self.apply(init_fn)
 
 
 def est_mlp(train_data, test_data, table_stats, columns):
-    """
-    est_mlp uses MLP to produce estimated rows for train_data and test_data
-    """
     train_dataset = QueryDataset(train_data, table_stats, columns)
     train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=10, shuffle=True, num_workers=1)
-    train_est_rows, train_act_rows = [], []
-    # YOUR CODE HERE: train procedure
-def weights_init(m):
-    classname = m._class_._name_
-    if classname.find('Linear') != -1:
-        torch.nn.init.normal_(m.weight,0.0,0.1)
 
-    net = nn.Sequential(nn.Linear(15,64),nn.ReLU(),nn.Linear(64,1),nn.ReLU())
-    loss_fn = nn.MSELoss()
-    tranier = torch.optim.Adam(net.parameters(),lr=0.01)
-    num_epochs = 30
-    net = net.cuda()
-    net.apply((weights_init()))
-    net.train()
-    for epoch in range(num_epochs):
-        epoch_losses = []
-        total = 0
-        for training_features,training_labels in iter(train_loader):
-            l = loss_fn(net(training_features.cuda()).reshape(-1),torch.log(training_labels.cuda()))
-            tranier.zero_grad()
-            l.backward()
-            epoch_losses.append((1,training_features.shape[0]))
-            total += training_features.shape[0]
-        total_loss = torch.tensor(0.,dtype=torch.float32)
-        for l, n in epoch_losses :
-            total_loss += l.cpu() * n / total
-        print("epoch {},loss:{}".format(epoch,l.item()))
+    mlp = MLP()
+    mlp.init_weights()
+
+    def loss_fn(predict_rows, actual_rows):
+        # return torch.mean(torch.square(torch.log2(torch.abs(predict_rows)) - torch.log2(actual_rows)))
+        est_rows = torch.abs(predict_rows)
+        return torch.mean(torch.square((est_rows - actual_rows) / (est_rows + actual_rows)))
+        # return torch.mean(torch.square(est_rows / actual_rows) + torch.square(actual_rows / est_rows))
+        # x = torch.clamp(torch.abs(predict_rows), min=1)
+        # y = actual_rows
+        # qerror = torch.max(x / y, y / x)
+        # return torch.mean(torch.square(qerror))
+
+    # loss_fn = nn.MSELoss()
+    optimizer = torch.optim.Adam(mlp.parameters(), lr=1e-4)
+    num_epoch = 10
+    for epoch in range(num_epoch):
+        print(f"epoch {epoch} start")
+        total_loss = 0.0
+        for i, data in enumerate(train_loader):
+            inputs, labels = data
+            optimizer.zero_grad()
+            outputs = mlp(inputs)
+            # print(f"inputs={inputs}")
+            # print(f"outputs={outputs}")
+            # print(f"labels={labels}")
+            loss = loss_fn(outputs, labels)
+            loss.backward()
+            optimizer.step()
+            # print(f"i={i}, loss={loss.item()}")
+            # if i % 100 == 0:
+            #     print(f"i={i}, loss={loss.item()}")
+            total_loss += loss.item()
+        print(f"epoch {epoch} finish, total_loss={format(total_loss, '.10E')}")
+
+    train_est_rows, train_act_rows = [], []
+    for i, data in enumerate(train_loader):
+        inputs, labels = data
+        outputs = mlp(inputs)
+        est = torch.abs(outputs).tolist()
+        # est = outputs.tolist()
+        act = labels.tolist()
+        # est = torch.exp2(outputs).tolist()
+        # act = torch.exp2(labels).tolist()
+        # est = torch.clamp(torch.abs(outputs), min=1).tolist()
+        # act = labels.tolist()
+        print(f"i={i}, est={est}, act={act}")
+        train_est_rows.extend(est)
+        train_act_rows.extend(act)
+
     test_dataset = QueryDataset(test_data, table_stats, columns)
     test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=10, shuffle=True, num_workers=1)
+
     test_est_rows, test_act_rows = [], []
-    # YOUR CODE HERE: test procedure
+    for i, data in enumerate(test_loader):
+        inputs, labels = data
+        outputs = mlp(inputs)
+        est = torch.abs(outputs).tolist()
+        # est = outputs.tolist()
+        act = labels.tolist()
+        # est = torch.exp2(outputs).tolist()
+        # act = torch.exp2(labels).tolist()
+        # est = torch.clamp(torch.abs(outputs), min=1).tolist()
+        # act = labels.tolist()
+        print(f"i={i}, est={est}, act={act}")
+        test_est_rows.extend(est)
+        test_act_rows.extend(act)
 
     return train_est_rows, train_act_rows, test_est_rows, test_act_rows
 
 
 def est_xgb(train_data, test_data, table_stats, columns):
-    """
-    est_xgb uses xgboost to produce estimated rows for train_data and test_data
-    """
     print("estimate row counts by xgboost")
     train_x, train_y = preprocess_queries(train_data, table_stats, columns)
-    train_est_rows, train_act_rows = [], []
-    # YOUR CODE HERE: train procedure
-    # train_x = np.array(train_x)
-    # train_y = np.array(train_y)
-    xgtrain = xgb.DMatrix(train_x, train_y)
-    param = {
-        'max_depth': 5,
-        'n_estimators': 500,
-        'learning_rate': 0.1,
-        'num_round': 200,
-        'eta': 0.1,
-        'silent': 1,
-        'subsample': 0.7,
-        'colsample_bytree': 0.7,
-        # 'objective': q_error,
-        # 'objective': 'reg:squaredlogerror'
-    }
-    # estimator = xgb.train(param, dtrain=xgtrain)
-    estimator = xgb.XGBRegressor(**param)
-    estimator.fit(train_x, train_y)
-    # train_est_rows = estimator.predict(xgtrain)
-    train_est_rows = estimator.predict(train_x)
-    test_x, test_y = preprocess_queries(test_data, table_stats, columns)
-    test_est_rows, test_act_rows = [], []
-    # YOUR CODE HERE: test procedure
-    # test_x = np.array(test_x)
-    # test_y = np.array(test_y)
-    # xgtest = xgb.DMatrix(test_x, test_y)
-    # test_est_rows = estimator.predict(xgtest)
-    test_est_rows = estimator.predict(test_x)
-    train_act_rows = train_y
-    test_act_rows = test_y
-    test_est_rows = test_est_rows.tolist()
-    train_est_rows = train_est_rows.tolist()
-    # print(test_est_rows)
-    return train_est_rows, train_act_rows, test_est_rows, test_act_rows
+    regressor = xgb.XGBRegressor(n_estimators=500, learning_rate=0.05, max_depth=4)
+    print('start fitting')
+    regressor.fit(train_x, train_y)
+    print('finish fitting')
+    train_pred = regressor.predict(train_x)
+    train_est_rows = np.exp2(train_pred).tolist()
+    train_act_rows = np.exp2(train_y).tolist()
 
+    test_x, test_y = preprocess_queries(test_data, table_stats, columns)
+    test_pred = regressor.predict(test_x)
+    test_est_rows = np.exp2(test_pred).tolist()
+    test_act_rows = np.exp2(test_y).tolist()
+
+    return train_est_rows, train_act_rows, test_est_rows, test_act_rows
 
 
 def eval_model(model, train_data, test_data, table_stats, columns):
@@ -178,5 +222,5 @@ if __name__ == '__main__':
     with open(test_json_file, 'r') as f:
         test_data = json.load(f)
 
-    eval_model('mlp', train_data, test_data, table_stats, columns)
     eval_model('xgb', train_data, test_data, table_stats, columns)
+
