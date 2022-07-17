@@ -1,45 +1,71 @@
+from plan import Operator
 import torch
 import torch.nn as nn
 
-from plan import Operator
 
-operators = ["Projection", "Selection", "Sort", "HashAgg", "HashJoin", "TableScan", "IndexScan", "TableReader",
-             "IndexReader", "IndexLookUp"]
+operators = ["Projection", "Selection", "Sort", "HashAgg", "HashJoin", "TableScan", "IndexScan", "TableRowIDScan", "TableReader", "IndexReader", "IndexLookUp"]
 
 
-# There are many ways to extract features from plan:
-# 1. The simplest way is to extract features from each node and sum them up. For example, we can get
-#      a  the number of nodes;
-#      a. the number of occurrences of each operator;
-#      b. the sum of estRows for each operator.
-#    However we lose the tree structure after extracting features.
-# 2. The second way is to extract features from each node and concatenate them in the DFS traversal order.
-#                  HashJoin_1
-#                  /          \
-#              IndexJoin_2   TableScan_6
-#              /         \
-#          IndexScan_3   IndexScan_4
-#    For example, we can concatenate the node features of the above plan as follows:
-#    [Feat(HashJoin_1)], [Feat(IndexJoin_2)], [Feat(IndexScan_3)], [Feat(IndexScan_4)], [Padding], [Feat(TableScan_6)], [Padding]
-#    Notice1: When we traverse all the children in DFS, we insert [Padding] as the end of the children. In this way, we
-#    have an one-on-one mapping between the plan tree and the DFS order sequence.
-#    Notice2: Since the different plans have the different number of nodes, we need padding to make the lengths of the
-#    features of different plans equal.
-class PlanFeatureCollector:
+class PlanFeatures:
     def __init__(self):
-        # YOUR CODE HERE: define variables to collect features from plans
-        pass
+        self.op_count = 0
+        # self.op_types = []
+        # self.op_est_rows = []
+        self.count_per_op = [0] * len(operators)
+        self.act_rows_per_op = [0] * len(operators)
 
     def add_operator(self, op: Operator):
-        # YOUR CODE HERE: extract features from op
-        pass
+        op_idx = None
+        for i, op_name in enumerate(operators):
+            if op_name in op.id:
+                op_idx = i
+                break
+            if op_name == "TableScan" and op.is_table_scan():
+                op_idx = i
+                break
+            if op_name == "IndexScan" and op.is_index_scan():
+                op_idx = i
+                break
+        if op_idx is None:
+            print(op.id)
+        assert op_idx is not None
+        self.op_count += 1
+        self.count_per_op[op_idx] += 1
+        self.act_rows_per_op[op_idx] += float(op.act_rows)
 
     def walk_operator_tree(self, op: Operator):
         self.add_operator(op)
         for child in op.children:
             self.walk_operator_tree(child)
-        # YOUR CODE HERE: process and return the features
-        pass
+
+
+class DFSOrderFeatures:
+    def __init__(self):
+        self.vec = []
+
+    def add_operator(self, op: Operator):
+        feat = [0.] * len(operators)
+        op_idx = None
+        for i, op_name in enumerate(operators):
+            if op_name in op.id:
+                op_idx = i
+                break
+            if op_name == "TableScan" and op.is_table_scan():
+                op_idx = i
+                break
+            if op_name == "IndexScan" and op.is_index_scan():
+                op_idx = i
+                break
+        assert op_idx is not None
+        feat[op_idx] = 1.
+        feat.append(float(op.act_rows))
+        self.vec.extend(feat)
+
+    def walk_operator_tree(self, op: Operator):
+        self.add_operator(op)
+        for child in op.children:
+            self.walk_operator_tree(child)
+        self.vec.extend([0.] * (len(operators) + 1))
 
 
 class PlanDataset(torch.utils.data.Dataset):
@@ -47,12 +73,16 @@ class PlanDataset(torch.utils.data.Dataset):
         super().__init__()
         self.data = []
         for plan in plans:
-            collector = PlanFeatureCollector()
-            vec = collector.walk_operator_tree(plan.root)
-            # YOUR CODE HERE: maybe you need padding the features if you choose the second way to extract the features.
-            features = torch.Tensor(vec)
+            # features = PlanFeatures()
+            # features.walk_operator_tree(plan.root)
+            # features = torch.Tensor([features.op_count] + features.count_per_op + features.act_rows_per_op)
+            features = DFSOrderFeatures()
+            features.walk_operator_tree(plan.root)
+            features.vec.extend([0.] * (max_operator_num * (len(operators) + 1) - len(features.vec)))
+            # print(f"len(vec):{len(features.vec)}")
+            feats = torch.Tensor(features.vec)
             exec_time = torch.Tensor([plan.exec_time_in_ms()])
-            self.data.append((features, exec_time))
+            self.data.append((feats, exec_time))
 
     def __getitem__(self, index):
         return self.data[index]
@@ -61,23 +91,35 @@ class PlanDataset(torch.utils.data.Dataset):
         return len(self.data)
 
 
-# Define your model for cost estimation
-class YourModel(nn.Module):
-    def __init__(self):
+class MLP(nn.Module):
+    def __init__(self, max_operator_num):
         super().__init__()
-        # YOUR CODE HERE
+        self.layers = nn.Sequential(
+            nn.Linear(max_operator_num * (len(operators) + 1), 256),
+            nn.ReLU(),
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Linear(128, 32),
+            nn.ReLU(),
+            nn.Linear(32, 1),
+        )
 
     def forward(self, x):
-        # YOUR CODE HERE
-        pass
+        return self.layers(x)
 
     def init_weights(self):
-        # YOUR CODE HERE
-        pass
+        def init_fn(m):
+            if isinstance(m, nn.Linear):
+                # nn.init.xavier_uniform_(m.weight)
+                m.weight.data.uniform_(-0.0001, 0.0001)
+                m.bias.data.fill_(0)
+        self.apply(init_fn)
+
+
 
 
 def count_operator_num(op: Operator):
-    num = 2  # one for the node and another for the end of children
+    num = 2 # one for the node and another for None
     for child in op.children:
         num += count_operator_num(child)
     return num
@@ -94,31 +136,50 @@ def estimate_learning(train_plans, test_plans):
     train_dataset = PlanDataset(train_plans, max_operator_num)
     train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=10, shuffle=False, num_workers=1)
 
-    model = YourModel()
-    model.init_weights()
+    mlp = MLP(max_operator_num)
+    mlp.init_weights()
 
     def loss_fn(est_time, act_time):
-        # YOUR CODE HERE: define loss function
-        pass
+        return torch.mean(torch.abs(est_time - act_time) / act_time)
 
-    # YOUR CODE HERE: complete training loop
-    num_epoch = 20
+    optimizer = torch.optim.Adam(mlp.parameters(), lr=1e-4)
+    num_epoch = 30
     for epoch in range(num_epoch):
         print(f"epoch {epoch} start")
+        total_loss = 0.0
         for i, data in enumerate(train_loader):
-            pass
+            features, exec_times = data
+            optimizer.zero_grad()
+            outputs = mlp(features)
+            # print(f"features={features}")
+            # print(f"outputs={outputs}")
+            # print(f"exec_times={exec_times}")
+            loss = loss_fn(outputs, exec_times)
+            loss.backward()
+            optimizer.step()
+            # print(f"i={i}, loss={loss.item()}")
+            # if i % 100 == 0:
+            #     print(f"i={i}, loss={loss.item()}")
+            total_loss += loss.item()
+        print(f"epoch {epoch} finish, total_loss={format(total_loss, '.10E')}")
 
     train_est_times, train_act_times = [], []
     for i, data in enumerate(train_loader):
-        # YOUR CODE HERE: evaluate on train data
-        pass
+        features, act_times = data
+        est_times = mlp(features)
+        # print(f"i={i}, est={est_times}, act={act_times}")
+        train_est_times.extend(est_times.tolist())
+        train_act_times.extend(act_times.tolist())
 
     test_dataset = PlanDataset(test_plans, max_operator_num)
     test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=10, shuffle=True, num_workers=1)
 
     test_est_times, test_act_times = [], []
     for i, data in enumerate(test_loader):
-        # YOUR CODE HERE: evaluate on test data
-        pass
+        features, act_times = data
+        est_times = mlp(features)
+        # print(f"i={i}, est={est_times}, act={act_times}")
+        test_est_times.extend(est_times.tolist())
+        test_act_times.extend(act_times.tolist())
 
     return train_est_times, train_act_times, test_est_times, test_act_times

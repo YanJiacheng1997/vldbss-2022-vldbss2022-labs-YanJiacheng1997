@@ -1,11 +1,19 @@
+import math
+
+import numpy as np
+from sklearn.linear_model import LinearRegression
+
+
 def estimate_plan(operator, factors, weights):
     cost = 0.0
     for child in operator.children:
         cost += estimate_plan(child, factors, weights)
 
     if operator.is_hash_agg():
-        # YOUR CODE HERE: hash_agg_cost = input_row_cnt * cpu_fac
-        pass
+        # hash_agg_cost = input_row_cnt * cpu_fac
+        input_row_cnt = operator.children[0].est_row_counts()
+        cost += input_row_cnt * factors['cpu']
+        weights['cpu'] += input_row_cnt
 
     elif operator.is_hash_join():
         # hash_join_cost = (build_hashmap_cost + probe_and_pair_cost)
@@ -18,32 +26,50 @@ def estimate_plan(operator, factors, weights):
         weights['cpu'] += (build_row_cnt + output_row_cnt)
 
     elif operator.is_sort():
-        # YOUR CODE HERE: sort_cost = input_row_cnt * log(input_row_cnt) * cpu_fac
-        pass
+        # sort_cost = input_row_cnt * log(input_row_cnt) * cpu_fac
+        input_row_cnt = operator.children[0].est_row_counts()
+        cost += input_row_cnt * math.log2(max(input_row_cnt, 1)) * factors['cpu']
+        weights['cpu'] += input_row_cnt * math.log2(max(input_row_cnt, 1))
 
     elif operator.is_selection():
-        # YOUR CODE HERE: selection_cost = input_row_cnt * cpu_fac
-        pass
+        # selection_cost = input_row_cnt * cpu_fac
+        input_row_cnt = operator.children[0].est_row_counts()
+        cost += input_row_cnt * factors['cpu']
+        weights['cpu'] += input_row_cnt
 
     elif operator.is_projection():
-        # YOUR CODE HERE: projection_cost = input_row_cnt * cpu_fac
-        pass
+        # projection_cost = input_row_cnt * cpu_fac
+        input_row_cnt = operator.children[0].est_row_counts()
+        cost += input_row_cnt * factors['cpu']
+        weights['cpu'] += input_row_cnt
 
     elif operator.is_table_reader():
-        # YOUR CODE HERE: table_reader_cost = input_row_cnt * input_row_size * net_fac
-        pass
+        # table_reader_cost = input_row_cnt * input_row_size * net_fac
+        input_row_cnt = operator.children[0].est_row_counts()
+        input_row_size = operator.children[0].row_size()
+        cost += input_row_cnt * input_row_size * factors['net']
+        weights['net'] += input_row_cnt * input_row_size
 
     elif operator.is_table_scan():
-        # YOUR CODE HERE: table_scan_cost = row_cnt * row_size * scan_fac
-        pass
+        # table_scan_cost = row_cnt * row_size * scan_fac
+        row_cnt = operator.est_row_counts()
+        row_size = operator.row_size()
+        cost += row_cnt * row_size * factors['scan']
+        weights['scan'] += row_cnt * row_size
 
     elif operator.is_index_reader():
-        # YOUR CODE HERE: index_reader_cost = input_row_cnt * input_row_size * net_fac
-        pass
+        # index_reader_cost = input_row_cnt * input_row_size * net_fac
+        input_row_cnt = operator.children[0].est_row_counts()
+        input_row_size = operator.children[0].row_size()
+        cost += input_row_cnt * input_row_size * factors['net']
+        weights['net'] += input_row_cnt * input_row_size
 
     elif operator.is_index_scan():
-        # YOUR CODE HERE: index_scan_cost = row_cnt * row_size * scan_fac
-        pass
+        # index_scan_cost = row_cnt * row_size * scan_fac
+        row_cnt = operator.est_row_counts()
+        row_size = operator.row_size()
+        cost += row_cnt * row_size * factors['scan']
+        weights['scan'] += row_cnt * row_size
 
     elif operator.is_index_lookup():
         # index_lookup_cost = net_cost + seek_cost
@@ -88,18 +114,30 @@ def estimate_calibration(train_plans, test_plans):
         act_times.append(p.exec_time_in_ms())
         est_costs_before.append(cost)
 
-    # YOUR CODE HERE
-    # calibrate your cost model with regression and get the best factors
-    # factors * weights ==> act_time
-    new_factors = {
+    # training: factors * weights = act_time
+    x = []
+    y = []
+    for i in range(0, len(act_times)):
+        x.append([weights[i]["cpu"], weights[i]["scan"],
+                  weights[i]["net"], weights[i]["seek"]])
+        y.append(act_times[i] * 1000000)
+    nx = np.array(x)
+    ny = np.array(y)
+    # TODO: normalization
+    lr = LinearRegression().fit(nx, ny)
+    factors = {
+        "cpu": lr.coef_[0],
+        "scan": lr.coef_[1],
+        "net": lr.coef_[2],
+        "seek": lr.coef_[3],
     }
-    print("--->>> regression cost factors: ", new_factors)
+    print("--->>> regression cost factors: ", factors)
 
     # evaluation
     est_costs = []
     for p in test_plans:
         w = {"cpu": 0, "scan": 0, "net": 0, "seek": 0}
-        cost = estimate_plan(p.root, new_factors, w)
+        cost = estimate_plan(p.root, factors, w)
         est_costs.append(cost)
 
     return est_costs
